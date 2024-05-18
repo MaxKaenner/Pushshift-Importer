@@ -62,7 +62,7 @@ impl Storable for Submission {
     }
 }
 
-fn deserialize_time<'de, D>(deserializer: D) -> Result<i64, D::Error>
+pub(crate) fn deserialize_time<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -70,6 +70,10 @@ where
     match json {
         serde_json::Value::Number(val) => val
             .as_i64()
+            .or_else(|| {
+                let float = val.as_f64()?;
+                Some(float as i64)
+            })
             .ok_or_else(|| serde::de::Error::custom(format!("invalid timestamp value {val}"))),
         serde_json::Value::String(val) => {
             let ret: i64 = val.parse().map_err(|_| {

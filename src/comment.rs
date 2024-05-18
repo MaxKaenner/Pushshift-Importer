@@ -18,6 +18,7 @@ pub struct Comment {
     pub score: Option<i32>,
     pub ups: Option<i32>,
     pub downs: Option<i32>,
+    #[serde(deserialize_with = "crate::submission::deserialize_time")]
     pub created_utc: i64,
     #[serde(default)]
     pub retrieved_on: Option<i64>,
