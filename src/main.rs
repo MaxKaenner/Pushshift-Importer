@@ -8,17 +8,17 @@ extern crate serde_json;
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, RwLock,
-    },
-    thread, time,
+    sync::{mpsc, Arc},
+    thread::{self},
+    time,
 };
 
 use anyhow::Result;
 use clap::{App, Arg};
+use itertools::Itertools;
 use log::{error, info, warn};
 use simple_logger::SimpleLogger;
+use threadpool::ThreadPool;
 
 use crate::{
     comment::Comment,
@@ -124,7 +124,7 @@ fn main() {
         matches.is_present("enable-fts"),
     )
     .expect("Error setting up sqlite DB");
-    let filter: Arc<Filter> = Arc::new(Filter::from_args(&matches));
+    let filter = Arc::new(Filter::from_args(&matches));
     if let Some(comments_dir) = matches.value_of("comments") {
         let file_list = get_file_list(Path::new(comments_dir));
         info!("Processing comments");
@@ -142,22 +142,14 @@ where
     T: Storage,
     U: Storable + FromJsonString + Filterable + Send + 'static,
 {
-    let shared_file_list = Arc::new(RwLock::new(file_list));
-    let completed = Arc::new(AtomicUsize::new(0));
-    let mut threads = Vec::new();
-    let (tx, rx) = mpsc::sync_channel(10000);
-    let num_cpus = num_cpus::get_physical();
-    for _i in 0..(num_cpus - 1) {
-        let filter_context = ThreadContext::new(
-            filter.clone(),
-            shared_file_list.clone(),
-            completed.clone(),
-            tx.clone(),
-        );
-        let thread = thread::spawn(move || {
-            filter_context.process_queue();
-        });
-        threads.push(thread);
+    let (tx, rx) = mpsc::sync_channel(1024 * 1024);
+    let num_cpus = num_cpus::get();
+    let thread_pool = Arc::new(ThreadPool::new((num_cpus - 1).max(1)));
+    for filename in file_list {
+        let filter = filter.clone();
+        let tx = tx.clone();
+        let pool = thread_pool.clone();
+        thread_pool.execute(move || process_file(filename, filter, tx, pool));
     }
 
     let mut count: usize = 0;
@@ -174,7 +166,7 @@ where
                 maybe_content.unwrap();
             }
             Err(mpsc::TryRecvError::Empty) => {
-                if completed.load(Ordering::Relaxed) < (num_cpus - 1) {
+                if thread_pool.active_count() + thread_pool.queued_count() > 0 {
                     thread::sleep(time::Duration::from_secs(1));
                 } else {
                     break;
@@ -185,9 +177,7 @@ where
 
     info!("Processed {} items", count);
 
-    for thread in threads {
-        thread.join().expect("threads to join");
-    }
+    thread_pool.join();
 }
 
 fn get_file_list(dir: &Path) -> Vec<PathBuf> {
@@ -197,62 +187,57 @@ fn get_file_list(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-struct ThreadContext<T> {
+fn process_file<T: FromJsonString + Filterable + Send + 'static>(
+    filename: PathBuf,
     filter: Arc<Filter>,
-    queue: Arc<RwLock<Vec<PathBuf>>>,
-    completed: Arc<AtomicUsize>,
     send_channel: mpsc::SyncSender<T>,
-}
-
-impl<T: FromJsonString + Filterable> ThreadContext<T> {
-    fn new(
-        filter: Arc<Filter>,
-        queue: Arc<RwLock<Vec<PathBuf>>>,
-        completed: Arc<AtomicUsize>,
-        send_channel: mpsc::SyncSender<T>,
-    ) -> Self {
-        ThreadContext {
-            filter,
-            queue,
-            completed,
-            send_channel,
+    pool: Arc<ThreadPool>,
+) {
+    let lines = match decompress::iter_lines(filename.as_path()) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Error encountered in input file: {:#}. Skipping file", e);
+            return;
         }
-    }
+    };
 
-    fn get_next_file(&self) -> Option<PathBuf> {
-        let mut queue = self.queue.write().expect("queue lock");
-        queue.pop()
-    }
-
-    fn process_queue(&self) {
-        while let Some(filename) = self.get_next_file() {
-            let lines = match decompress::iter_lines(filename.as_path()) {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!("Error encountered in input file: {:#}. Skipping file", e);
-                    continue;
-                }
-            };
-
-            let item_iterator = lines
-                .map(|line| T::from_json_str(line.as_str()))
-                .filter_map(|maybe_content| {
-                    maybe_content
-                        .map_err(|err| {
-                            error!("Error parsing content: {:#?}", err);
-                            err
-                        })
-                        .ok()
-                })
-                .filter(|content| self.filter.filter(content));
-            for content in item_iterator {
-                self.send_channel
-                    .send(content)
-                    .unwrap_or_else(|_| panic!("failed to parse line from {}", filename.display()));
+    for chunk in &lines.chunks(32) {
+        let chunk = chunk.collect_vec();
+        while pool.queued_count() > 2 * pool.active_count() {
+            for line in &chunk {
+                process_line(line.as_str(), &filter, &send_channel, &filename);
             }
         }
-        self.completed.fetch_add(1, Ordering::Relaxed);
+        let filter = filter.clone();
+        let send_channel = send_channel.clone();
+        let filename = filename.clone();
+        pool.execute(move || {
+            for line in &chunk {
+                process_line(line.as_str(), &filter, &send_channel, &filename);
+            }
+        });
     }
+}
+
+fn process_line<T: FromJsonString + Filterable>(
+    line: &str,
+    filter: &Filter,
+    send_channel: &mpsc::SyncSender<T>,
+    filename: &Path,
+) {
+    let content = match T::from_json_str(line) {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Error parsing content: {e:#?}");
+            return;
+        }
+    };
+    if filter.filter(&content) {
+        return;
+    };
+    send_channel
+        .send(content)
+        .unwrap_or_else(|_| panic!("failed to send line from {}", filename.display()));
 }
 
 // TODO: Use a standard deserialize trait
